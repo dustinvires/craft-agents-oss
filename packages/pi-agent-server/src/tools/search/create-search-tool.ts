@@ -10,9 +10,11 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { WebSearchProvider, WebSearchResult } from './types.ts';
 import { DDGSearchProvider } from './providers/ddg.ts';
 
-// A stalled provider must not hold an agent turn indefinitely. Provider-level request
-// timeouts still apply; this caps the entire primary + fallback sequence.
-const SEARCH_DEADLINE_MS = 90_000;
+// A slow search is not proof of provider failure. Allow slow searches to finish,
+// but do not leave an agent turn stuck indefinitely if a provider never settles.
+const SEARCH_DEADLINE_MS = 300_000;
+const SEARCH_STALLED = 'Web search stalled:';
+const SEARCH_FAILED = 'Web search failed:';
 
 const schema = Type.Object({
   query: Type.String({ description: 'The search query' }),
@@ -70,22 +72,23 @@ export function createSearchTool(
     promptSnippet:
       'Use web_search for up-to-date information, documentation lookups, or fact-checking. Returns titles, URLs, and snippets. Accepts a query string and optional count (1-10).',
     parameters: schema,
-    async execute(toolCallId, params) {
+    async execute(toolCallId, params, signal) {
       const { query } = params;
       const count = Math.max(1, Math.min(10, params.count ?? 5));
       const deadlineMs = Math.max(1, options?.deadlineMs ?? SEARCH_DEADLINE_MS);
       const controller = new AbortController();
+      const cancel = () => controller.abort();
+      if (signal?.aborted) signal.throwIfAborted();
+      signal?.addEventListener('abort', cancel, { once: true });
       let timer: ReturnType<typeof setTimeout> | undefined;
       let timedOut = false;
+      const stalledMessage = `${SEARCH_STALLED} No result after ${deadlineMs} ms; provider status unknown.`;
 
-      const deadline = new Promise<{ content: Array<{ type: 'text'; text: string }>; details: { isError: boolean } }>(resolve => {
+      const deadline = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           timedOut = true;
           controller.abort();
-          resolve({
-            content: [{ type: 'text', text: `Search timed out after ${deadlineMs} ms for "${query}" (primary and fallback combined).` }],
-            details: { isError: true },
-          });
+          reject(new Error(stalledMessage));
         }, deadlineMs);
       });
 
@@ -94,9 +97,11 @@ export function createSearchTool(
           const results = await provider.search(query, count, controller.signal);
           return formatResults(query, provider.name, results);
         } catch (err) {
+          if (timedOut) throw new Error(stalledMessage);
+          signal?.throwIfAborted();
           const primaryMsg = err instanceof Error ? err.message : String(err);
 
-          const canFallback = !timedOut && provider.name !== fallbackProvider.name;
+          const canFallback = provider.name !== fallbackProvider.name;
           if (canFallback) {
             try {
               const fallbackResults = await fallbackProvider.search(query, count, controller.signal);
@@ -107,28 +112,14 @@ export function createSearchTool(
                 `Primary search provider (${provider.name}) failed (${formatErrorSnippet(primaryMsg)}), automatically fell back to ${fallbackProvider.name}.`,
               );
             } catch (fallbackErr) {
+              if (timedOut) throw new Error(stalledMessage);
+              signal?.throwIfAborted();
               const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-              return {
-                content: [
-                  {
-                    type: 'text' as const,
-                    text: `Search failed for "${query}": primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"`,
-                  },
-                ],
-                details: { isError: true },
-              };
+              throw new Error(`${SEARCH_FAILED} primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"`);
             }
           }
 
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `Search failed for "${query}": ${formatErrorSnippet(primaryMsg, 400)}`,
-              },
-            ],
-            details: { isError: true },
-          };
+          throw new Error(`${SEARCH_FAILED} ${formatErrorSnippet(primaryMsg, 400)}`);
         }
       };
 
@@ -136,6 +127,7 @@ export function createSearchTool(
         return await Promise.race([search(), deadline]);
       } finally {
         if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', cancel);
       }
     },
   };

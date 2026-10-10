@@ -97,11 +97,8 @@ describe('createSearchTool', () => {
     };
 
     const tool = createSearchTool(provider, fallbackProvider);
-    const result = await tool.execute('tool-3', { query: 'craft', count: -1 });
-
-    expect(result.details?.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain('primary (OpenAI) failed');
-    expect((result.content[0] as any).text).toContain('fallback (DuckDuckGo) failed');
+    await expect(tool.execute('tool-3', { query: 'craft', count: -1 }))
+      .rejects.toThrow(/Web search failed: primary \(OpenAI\).*fallback \(DuckDuckGo\)/);
   });
 
   it('truncates oversized provider errors in the tool result', async () => {
@@ -122,14 +119,13 @@ describe('createSearchTool', () => {
     };
 
     const tool = createSearchTool(provider, fallbackProvider);
-    const result = await tool.execute('tool-5', { query: 'craft' });
-
-    const text = (result.content[0] as any).text as string;
-    expect(result.details?.isError).toBe(true);
+    let text = '';
+    try { await tool.execute('tool-5', { query: 'craft' }); }
+    catch (error) { text = error instanceof Error ? error.message : String(error); }
     expect(text).toContain('primary detail');
     expect(text).toContain('fallback detail');
     expect(text).toContain('…');
-    // Both messages capped at 400 chars — the combined result stays compact.
+    // Both messages capped at 400 chars — the combined error stays compact.
     expect(text.length).toBeLessThan(1_000);
   });
 
@@ -151,11 +147,9 @@ describe('createSearchTool', () => {
       },
     };
 
-    const result = await createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
-      .execute('call-stall', { query: 'test' });
-
-    expect(result.details?.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain('timed out after 10 ms');
+    await expect(createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
+      .execute('call-stall', { query: 'test' }))
+      .rejects.toThrow('Web search stalled: No result after 10 ms; provider status unknown.');
     expect(passedSignal?.aborted).toBe(true);
     expect(fallbackCalls).toBe(0);
   });
@@ -170,11 +164,9 @@ describe('createSearchTool', () => {
         return new Promise(() => {});
       },
     };
-    const result = await createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
-      .execute('call-fallback-stall', { query: 'test' });
-
-    expect(result.details?.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain('timed out after 10 ms');
+    await expect(createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
+      .execute('call-fallback-stall', { query: 'test' }))
+      .rejects.toThrow('Web search stalled: No result after 10 ms; provider status unknown.');
     expect(fallbackSignal?.aborted).toBe(true);
   });
 
@@ -187,10 +179,37 @@ describe('createSearchTool', () => {
     };
 
     const tool = createSearchTool(ddgProvider, ddgProvider);
-    const result = await tool.execute('tool-4', { query: 'craft' });
+    await expect(tool.execute('tool-4', { query: 'craft' }))
+      .rejects.toThrow('Web search failed: ddg boom');
+  });
 
-    expect(result.details?.isError).toBe(true);
-    expect((result.content[0] as any).text).toContain('Search failed');
-    expect((result.content[0] as any).text).toContain('ddg boom');
+  it('lets a slow but healthy provider finish before the final safety limit', async () => {
+    const provider: WebSearchProvider = {
+      name: 'Slow',
+      async search() {
+        await new Promise(resolve => setTimeout(resolve, 35));
+        return [{ title: 'Good result', url: 'https://example.com', description: 'ok' }];
+      },
+    };
+    const result = await createSearchTool(provider, provider, { deadlineMs: 120 })
+      .execute('call-slow', { query: 'test' });
+    expect((result.content[0] as any).text).toContain('Good result');
+  });
+
+  it('does not notify a failure or try fallback when the user cancels', async () => {
+    const controller = new AbortController();
+    let fallbackCalls = 0;
+    const provider: WebSearchProvider = {
+      name: 'Cancel',
+      async search(_query, _count, signal) {
+        return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      },
+    };
+    const fallback: WebSearchProvider = { name: 'DuckDuckGo', async search() { fallbackCalls++; return []; } };
+    const result = createSearchTool(provider, fallback, { deadlineMs: 200 })
+      .execute('call-cancel', { query: 'test' }, controller.signal);
+    controller.abort(new Error('User cancelled'));
+    await expect(result).rejects.toThrow('User cancelled');
+    expect(fallbackCalls).toBe(0);
   });
 });
