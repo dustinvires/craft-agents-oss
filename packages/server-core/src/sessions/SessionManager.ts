@@ -1138,6 +1138,8 @@ const DEFAULT_TOKEN_USAGE = {
 function managedToSession(m: ManagedSession, overrides?: Partial<Session>): Session {
   return {
     ...pickSessionFields(m),
+    // Recovery must distinguish no enabled sources from unknown/missing metadata.
+    enabledSourceSlugs: m.enabledSourceSlugs ?? [],
     // Pre-computed fields from header (not in SESSION_PERSISTENT_FIELDS)
     preview: m.preview,
     lastMessageRole: m.lastMessageRole,
@@ -6545,13 +6547,18 @@ export class SessionManager implements ISessionManager {
       await this.flushSession(managed.id)
       onAck?.(userMessage.id)
 
-      // Emit user_message event so UI can confirm the optimistic message
+      // Record permission state at the actual start of a new turn. A recovery
+      // watchdog can only replay if this was safe and the authoritative mode
+      // version has not changed since (including a flip away and back).
+      const turnMode = this.getSessionPermissionModeState(sessionId)
       this.sendEvent({
         type: 'user_message',
         sessionId,
         message: userMessage,
         status: 'accepted',
-        optimisticMessageId: options?.optimisticMessageId
+        optimisticMessageId: options?.optimisticMessageId,
+        permissionModeAtStart: turnMode?.permissionMode,
+        modeVersionAtStart: turnMode?.modeVersion,
       }, managed.workspace.id)
 
       // If this is the first user message and no title exists, set one immediately

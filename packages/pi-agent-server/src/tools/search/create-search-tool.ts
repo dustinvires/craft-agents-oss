@@ -9,6 +9,7 @@ import { Type } from '@earendil-works/pi-ai';
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { WebSearchProvider, WebSearchResult } from './types.ts';
 import { DDGSearchProvider } from './providers/ddg.ts';
+import { captureFailedSearchResponse } from './failure-evidence.ts';
 
 // A slow search is not proof of provider failure. Allow slow searches to finish,
 // but do not leave an agent turn stuck indefinitely if a provider never settles.
@@ -62,7 +63,7 @@ function formatErrorSnippet(message: string, max = 180): string {
 export function createSearchTool(
   provider: WebSearchProvider,
   fallbackProvider: WebSearchProvider = new DDGSearchProvider(),
-  options?: { deadlineMs?: number },
+  options?: { deadlineMs?: number; evidenceRoot?: string },
 ): ToolDefinition<typeof schema> {
   return {
     name: 'web_search',
@@ -115,11 +116,14 @@ export function createSearchTool(
               if (timedOut) throw new Error(stalledMessage);
               signal?.throwIfAborted();
               const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-              throw new Error(`${SEARCH_FAILED} primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"`);
+              const evidenceId = captureFailedSearchResponse(err, options?.evidenceRoot)
+                ?? captureFailedSearchResponse(fallbackErr, options?.evidenceRoot);
+              throw new Error(`${SEARCH_FAILED} primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"${evidenceId ? `; encrypted evidence id=${evidenceId}` : ''}`);
             }
           }
 
-          throw new Error(`${SEARCH_FAILED} ${formatErrorSnippet(primaryMsg, 400)}`);
+          const evidenceId = captureFailedSearchResponse(err, options?.evidenceRoot);
+          throw new Error(`${SEARCH_FAILED} ${formatErrorSnippet(primaryMsg, 400)}${evidenceId ? `; encrypted evidence id=${evidenceId}` : ''}`);
         }
       };
 

@@ -98,6 +98,7 @@ import { getDefaultSummarizationModel } from '../../shared/src/config/models.ts'
 import { createWebFetchTool } from './tools/web-fetch.ts';
 import { resolveSearchProvider } from './tools/search/resolve-provider.ts';
 import { createSearchTool } from './tools/search/create-search-tool.ts';
+import { createDynamicSearchProvider } from './tools/search/dynamic-provider.ts';
 import { allowCraftMetadataProperties, stripCraftMetadata } from './craft-metadata-schema.ts';
 import {
   createCraftResourceLoader,
@@ -623,15 +624,12 @@ async function ensureSession(): Promise<AgentSession> {
   // account supports instead of a hardcoded one (craft-agents-oss#1023). Resolved per call
   // (alongside the provider) so set_model / token_update refreshes are picked up live.
   const activeSearchModel = () => (initConfig?.model ? stripPiPrefix(initConfig.model) : undefined);
-  const searchProvider = {
-    get name() {
-      return resolveSearchProvider(initConfig?.piAuth, activeSearchModel()).name;
-    },
-    async search(query: string, count: number) {
-      return resolveSearchProvider(initConfig?.piAuth, activeSearchModel()).search(query, count);
-    },
-  };
-  const searchTool = createSearchTool(searchProvider);
+  const searchProvider = createDynamicSearchProvider(() =>
+    resolveSearchProvider(initConfig?.piAuth, activeSearchModel())
+  );
+  const searchTool = createSearchTool(searchProvider, undefined, {
+    evidenceRoot: join(initConfig.workspaceRootPath, '.search-failure-evidence'),
+  });
   const webFetchTool = createWebFetchTool(() =>
     initConfig ? getSessionPath(initConfig.workspaceRootPath, initConfig.sessionId) : null
   );
