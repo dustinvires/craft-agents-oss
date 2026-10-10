@@ -34,6 +34,7 @@ export const RPC_CHANNELS = {
     GET_PENDING_PLAN_EXECUTION: 'sessions:getPendingPlanExecution',
     GET_PERMISSION_MODE_STATE: 'sessions:getPermissionModeState',
     LIST_BACKGROUND_TASKS: 'sessions:listBackgroundTasks',
+    CANCEL_READ_ONLY_TURN: 'sessions:cancelReadOnlyTurn',
     EVENT: 'session:event',
     GET_MODEL: 'session:getModel',
     SET_MODEL: 'session:setModel',

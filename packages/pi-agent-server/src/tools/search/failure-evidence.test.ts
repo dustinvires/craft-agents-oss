@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { captureFailedSearchResponse, pruneFailureEvidence, rememberFailedResponse } from './failure-evidence.ts';
 import { createSearchTool } from './create-search-tool.ts';
+import { ResponsesApiSearchProvider } from './providers/openai.ts';
 
 const dirs: string[] = [];
 const priorSetting = process.env.CRAFT_SEARCH_FAILURE_EVIDENCE;
@@ -74,6 +75,33 @@ describe('opt-in search failure evidence', () => {
     const decoded = JSON.parse(result.stdout);
     expect(decoded.response.status).toBe(400);
     expect(decoded.response.raw).toContain('PRIVATE QUERY + PROVIDER BODY');
+  }, 15_000);
+
+  it('encrypts an OpenAI-compatible HTTP failure without quoting its raw body', async () => {
+    if (process.platform !== 'win32') return;
+    process.env.CRAFT_SEARCH_FAILURE_EVIDENCE = '1';
+    const root = join(tempRoot(), '.search-failure-evidence');
+    const priorFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response('{"error":{"message":"PRIVATE QUERY AND PAGE"}}', {
+      status: 403, headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch;
+    try {
+      const provider = new ResponsesApiSearchProvider({ apiBase: 'https://example.invalid/v1', apiKey: 'synthetic' });
+      const fallback = { name: 'DuckDuckGo', async search(): Promise<never> { throw new Error('fallback rejected'); } };
+      let message = '';
+      try { await createSearchTool(provider, fallback, { evidenceRoot: root }).execute('id', { query: 'PRIVATE QUERY' }); }
+      catch (error) { message = String(error); }
+      expect(message).toContain('Web search failed:');
+      expect(message).toContain('HTTP 403');
+      expect(message).toContain('encrypted evidence id=');
+      expect(message).not.toContain('PRIVATE QUERY');
+      expect(message).not.toContain('PRIVATE QUERY AND PAGE');
+      const files = readdirSync(root);
+      expect(files).toHaveLength(1);
+      expect(readFileSync(join(root, files[0]!)).includes(Buffer.from('PRIVATE QUERY'))).toBe(false);
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
   }, 15_000);
 
   it('does not retain a rejected primary response if fallback succeeds', async () => {

@@ -77,7 +77,8 @@ describe('createSearchTool', () => {
 
     expect(result.details?.isError).toBeUndefined();
     expect((result.content[0] as any).text).toContain('automatically fell back to DuckDuckGo');
-    expect((result.content[0] as any).text).toContain('401 missing scope');
+    expect((result.content[0] as any).text).toContain('provider error (details omitted)');
+    expect((result.content[0] as any).text).not.toContain('401 missing scope');
     expect((result.content[0] as any).text).toContain('https://fallback.example');
   });
 
@@ -101,7 +102,7 @@ describe('createSearchTool', () => {
       .rejects.toThrow(/Web search failed: primary \(OpenAI\).*fallback \(DuckDuckGo\)/);
   });
 
-  it('truncates oversized provider errors in the tool result', async () => {
+  it('omits untrusted provider messages on an all-provider failure', async () => {
     const hugePrimary = `primary detail ${'x'.repeat(5_000)}`;
     const hugeFallback = `fallback detail ${'y'.repeat(5_000)}`;
     const provider: WebSearchProvider = {
@@ -122,10 +123,10 @@ describe('createSearchTool', () => {
     let text = '';
     try { await tool.execute('tool-5', { query: 'craft' }); }
     catch (error) { text = error instanceof Error ? error.message : String(error); }
-    expect(text).toContain('primary detail');
-    expect(text).toContain('fallback detail');
-    expect(text).toContain('…');
-    // Both messages capped at 400 chars — the combined error stays compact.
+    expect(text).not.toContain('primary detail');
+    expect(text).not.toContain('fallback detail');
+    expect(text).not.toContain('x'.repeat(100));
+    expect(text).toContain('provider error (details omitted)');
     expect(text.length).toBeLessThan(1_000);
   });
 
@@ -180,7 +181,17 @@ describe('createSearchTool', () => {
 
     const tool = createSearchTool(ddgProvider, ddgProvider);
     await expect(tool.execute('tool-4', { query: 'craft' }))
-      .rejects.toThrow('Web search failed: ddg boom');
+      .rejects.toThrow('Web search failed: provider error (details omitted)');
+  });
+
+  it('does not infer HTTP status from a provider error echoing the query', async () => {
+    const provider: WebSearchProvider = {
+      name: 'DuckDuckGo',
+      async search(query) { throw new Error(`query ${query} rejected`); },
+    };
+    const tool = createSearchTool(provider, provider);
+    await expect(tool.execute('forged-status', { query: 'HTTP 403 PRIVATE QUERY' }))
+      .rejects.toThrow(/^Web search failed: provider error \(details omitted\)$/);
   });
 
   it('lets a slow but healthy provider finish before the final safety limit', async () => {

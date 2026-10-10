@@ -4,7 +4,7 @@ import type { HandlerFn, RpcServer, RequestContext } from '@craft-agent/server-c
 import type { HandlerDeps } from '../handler-deps';
 import { registerSessionsHandlers } from './sessions';
 
-function harness(backgroundAvailable = true) {
+function harness(backgroundAvailable = true, guardedAvailable = true) {
   const handlers = new Map<string, HandlerFn>();
   const server = { handle(channel: string, fn: HandlerFn) { handlers.set(channel, fn); } } as RpcServer;
   const calls: string[] = [];
@@ -16,6 +16,10 @@ function harness(backgroundAvailable = true) {
     ...(backgroundAvailable ? { listBackgroundTasks(id: string) {
       calls.push(`tasks:${id}`);
       return [{ taskId: 'ongoing', status: 'running' }];
+    } } : {}),
+    ...(guardedAvailable ? { async cancelReadOnlyTurn(id: string, turn: string, version: number) {
+      calls.push(`stop:${id}:${turn}:${version}`);
+      return version === 42;
     } } : {}),
   };
   const deps = {
@@ -35,6 +39,17 @@ describe('read-only turn recovery RPC facts', () => {
     expect(await mode(ctx, '261010-test-turn')).toEqual({ permissionMode: 'safe', modeVersion: 42 });
     expect(await tasks(ctx, '261010-test-turn')).toEqual([{ taskId: 'ongoing', status: 'running' }]);
     expect(calls).toEqual(['mode:261010-test-turn', 'tasks:261010-test-turn']);
+  });
+
+  it('routes conditional stop and refuses missing guarded manager support', async () => {
+    const { handlers, ctx, calls } = harness();
+    const stop = handlers.get(RPC_CHANNELS.sessions.CANCEL_READ_ONLY_TURN)!;
+    expect(await stop(ctx, '261010-test-turn', 'msg-1', 42)).toBe(true);
+    expect(await stop(ctx, '261010-test-turn', 'msg-1', 41)).toBe(false);
+    expect(calls).toEqual(['stop:261010-test-turn:msg-1:42', 'stop:261010-test-turn:msg-1:41']);
+    const absent = harness(true, false);
+    await expect(absent.handlers.get(RPC_CHANNELS.sessions.CANCEL_READ_ONLY_TURN)!(absent.ctx, 'id', 'msg', 42))
+      .rejects.toThrow('Guarded cancellation unavailable');
   });
 
   it('rejects missing background registry rather than claiming no tasks exist', async () => {

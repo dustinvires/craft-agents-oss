@@ -9,6 +9,7 @@
  */
 
 import type { WebSearchProvider, WebSearchResult } from '../types.ts';
+import { rememberFailedResponse } from '../failure-evidence.ts';
 import { parseResponsesApiResults, type ResponsesApiResponse } from './responses-api-parser.ts';
 
 const DEFAULT_SEARCH_MODEL = 'gpt-4o-mini';
@@ -33,7 +34,7 @@ export class ResponsesApiSearchProvider implements WebSearchProvider {
     this.name = config.displayName || deriveDisplayName(config.apiBase);
   }
 
-  async search(query: string, count: number): Promise<WebSearchResult[]> {
+  async search(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
     const response = await fetch(`${this.config.apiBase}/responses`, {
       method: 'POST',
       headers: {
@@ -46,16 +47,48 @@ export class ResponsesApiSearchProvider implements WebSearchProvider {
         tools: [{ type: 'web_search' }],
         input: `Search the web for: ${query}\n\nReturn the top ${count} results with title, URL, and a brief description.`,
       }),
-      signal: AbortSignal.timeout(30_000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     });
 
+    const raw = await readBoundedBody(response);
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`${this.name} search failed (HTTP ${response.status}): ${errorText}`);
+      const error = new Error(`Search provider HTTP ${response.status}`);
+      rememberFailedResponse(error, { raw, status: response.status, contentType: response.headers.get('content-type') || 'unknown' });
+      throw error;
     }
 
-    const data = (await response.json()) as ResponsesApiResponse;
-    return parseResponsesApiResults(data, query, count);
+    try {
+      const data = JSON.parse(raw) as ResponsesApiResponse;
+      return parseResponsesApiResults(data, query, count);
+    } catch {
+      const error = new Error('Search provider returned an invalid response payload');
+      rememberFailedResponse(error, { raw, status: response.status, contentType: response.headers.get('content-type') || 'unknown' });
+      throw error;
+    }
+  }
+}
+
+// Do not materialize unbounded provider error/HTML responses in memory.
+async function readBoundedBody(response: Response): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 2 * 1024 * 1024) {
+        await reader.cancel().catch(() => {});
+        throw new Error('Search provider response exceeded the 2 MiB safety limit');
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
   }
 }
 

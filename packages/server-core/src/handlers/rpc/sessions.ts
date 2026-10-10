@@ -119,6 +119,7 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.sessions.GET_PENDING_PLAN_EXECUTION,
   RPC_CHANNELS.sessions.GET_PERMISSION_MODE_STATE,
   RPC_CHANNELS.sessions.LIST_BACKGROUND_TASKS,
+  RPC_CHANNELS.sessions.CANCEL_READ_ONLY_TURN,
   RPC_CHANNELS.sessions.SEARCH_CONTENT,
   RPC_CHANNELS.sessions.GET_FILES,
   RPC_CHANNELS.sessions.GET_NOTES,
@@ -414,6 +415,16 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
   ) => {
     if (!sessionManager.listBackgroundTasks) throw new Error('Background task registry unavailable')
     return sessionManager.listBackgroundTasks(sessionId)
+  })
+
+  server.handle(RPC_CHANNELS.sessions.CANCEL_READ_ONLY_TURN, async (
+    _ctx,
+    sessionId: string,
+    turnId: string,
+    expectedModeVersion: number
+  ) => {
+    if (!sessionManager.cancelReadOnlyTurn) throw new Error('Guarded cancellation unavailable')
+    return sessionManager.cancelReadOnlyTurn(sessionId, turnId, expectedModeVersion)
   })
 
   // ============================================================

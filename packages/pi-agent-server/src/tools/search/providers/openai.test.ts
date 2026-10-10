@@ -188,6 +188,36 @@ describe('ResponsesApiSearchProvider', () => {
     expect(calledHeaders['X-Custom']).toBe('value');
   });
 
+  it('omits provider-controlled HTTP body and honors aggregate cancellation', async () => {
+    let seenSignal: AbortSignal | null = null;
+    globalThis.fetch = (async (_url, init) => {
+      seenSignal = init?.signal as AbortSignal;
+      return new Response('{"error":{"message":"PRIVATE QUERY AND PAGE"}}', {
+        status: 403, headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const controller = new AbortController();
+    const provider = new ResponsesApiSearchProvider({ apiBase: 'https://api.openai.com/v1', apiKey: 'dummy' });
+    await expect(provider.search('PRIVATE QUERY', 5, controller.signal)).rejects.toThrow('HTTP 403');
+    expect(seenSignal).not.toBeNull();
+    controller.abort();
+    expect(seenSignal?.aborted).toBe(true);
+    try { await provider.search('PRIVATE QUERY', 5); }
+    catch (error) { expect(String(error)).not.toContain('PRIVATE QUERY'); }
+  });
+
+  it('omits a malformed successful response instead of quoting it', async () => {
+    globalThis.fetch = (async () => new Response('PRIVATE QUERY AND PAGE', { status: 200 })) as typeof fetch;
+    const provider = new ResponsesApiSearchProvider({ apiBase: 'https://api.openai.com/v1', apiKey: 'dummy' });
+    await expect(provider.search('PRIVATE QUERY', 5)).rejects.toThrow('invalid response payload');
+  });
+
+  it('aborts an oversized provider body before materializing it', async () => {
+    globalThis.fetch = (async () => new Response('x'.repeat(2 * 1024 * 1024 + 1), { status: 500 })) as typeof fetch;
+    const provider = new ResponsesApiSearchProvider({ apiBase: 'https://api.openai.com/v1', apiKey: 'dummy' });
+    await expect(provider.search('secret', 5)).rejects.toThrow('2 MiB safety limit');
+  });
+
   it('derives display name from apiBase', () => {
     const openai = new ResponsesApiSearchProvider({
       apiBase: 'https://api.openai.com/v1',

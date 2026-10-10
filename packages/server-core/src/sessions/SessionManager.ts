@@ -1246,6 +1246,9 @@ export function canSteerTextPayload(
 
 export class SessionManager implements ISessionManager {
   private sessions: Map<string, ManagedSession> = new Map()
+  // Set before the first async step of tool_start. A partial/unflushed tool
+  // message must never look like a completed read during guarded cancellation.
+  private activeToolUseIds: Map<string, Set<string>> = new Map()
   // Delta batching for performance - reduces IPC events from 50+/sec to ~20/sec
   private pendingDeltas: Map<string, PendingDelta> = new Map()
   private deltaFlushTimers: Map<string, NodeJS.Timeout> = new Map()
@@ -3505,6 +3508,7 @@ export class SessionManager implements ISessionManager {
                 m.autoRetryTimer = undefined
               }
               if (m) m.autoRetryPending = undefined
+              this.activeToolUseIds.delete(id)
               this.sessions.delete(id)
             },
             deleteStoredSession,
@@ -6338,6 +6342,7 @@ export class SessionManager implements ISessionManager {
     }
     managed.autoRetryPending = undefined
 
+    this.activeToolUseIds.delete(sessionId)
     this.sessions.delete(sessionId)
 
     // Clean up session metadata in AutomationSystem (prevents memory leak)
@@ -7044,6 +7049,45 @@ export class SessionManager implements ISessionManager {
         this.onProcessingStopped(sessionId, 'interrupted')
       }
     }
+  }
+
+  /**
+   * Fail-closed stop for a watchdog's *one* read-only replay. Validate current
+   * server-owned state and set stopRequested in the same JS task: no RPC gap
+   * between the last check and the start of cancellation. This is deliberately
+   * stricter than Explore's general tool policy: a visually Read-classified
+   * Bash still carries `_command`, and external tools have unknown semantics.
+   */
+  async cancelReadOnlyTurn(sessionId: string, turnId: string, expectedModeVersion: number): Promise<boolean> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed?.isProcessing || managed.stopRequested || !turnId || !Number.isSafeInteger(expectedModeVersion)) return false
+    const mode = this.getSessionPermissionModeState(sessionId)
+    if (mode?.permissionMode !== 'safe' || mode.modeVersion !== expectedModeVersion) return false
+    if (!Array.isArray(managed.enabledSourceSlugs) || managed.enabledSourceSlugs.length > 0) return false
+    if (managed.messageQueue.length || managed.acceptedSteers?.size || managed.turnSteers?.length ||
+        managed.pendingPlanExecution || managed.autoRetryPending || managed.pendingActivationResend ||
+        managed.pendingAuthRequestId || managed.pendingAuthRequest || managed.agent?.isCompactionInFlight?.()) return false
+    if (this.pendingCredentialResolvers.size > 0 ||
+        [...this.pendingPermissionRequests.values()].some(p => p.sessionId === sessionId)) return false
+    if ([...managed.backgroundTaskRegistry.values()].some(t =>
+      !['completed', 'failed', 'stopped', 'orphaned'].includes(t.status))) return false
+    if (this.activeToolUseIds.get(sessionId)?.size) return false
+    const start = managed.messages.findIndex(m => m.id === turnId && m.role === 'user' && !m.hidden)
+    if (start < 0) return false
+    const readTools = new Set(['read', 'grep', 'glob', 'find', 'websearch'])
+    for (const message of managed.messages.slice(start + 1)) {
+      if (message.role === 'user') return false
+      if (message.role !== 'tool') continue
+      const tool = (message.toolName ?? '').toLowerCase().replace(/[^a-z]/g, '')
+      if (!readTools.has(tool) || !message.toolInput || !Object.keys(message.toolInput).length ||
+          '_command' in message.toolInput || message.parentToolUseId ||
+          !['completed', 'error'].includes(message.toolStatus ?? '')) return false
+    }
+    // cancelProcessing sets stopRequested / stopEpoch before its first await.
+    // Nothing else on this JS event loop can start a new tool between the above
+    // checks and that synchronous part of cancellation.
+    await this.cancelProcessing(sessionId)
+    return true
   }
 
   async cancelProcessing(sessionId: string, silent = false): Promise<void> {
@@ -8455,6 +8499,9 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'tool_start': {
+        let active = this.activeToolUseIds.get(sessionId)
+        if (!active) this.activeToolUseIds.set(sessionId, active = new Set())
+        active.add(event.toolUseId)
         this.noteSuggestionUse(managed, { toolName: event.toolName, input: event.input })
         noteLargeResultFileUse(managed.id, event.input)
         // Format tool input paths to relative for better readability
@@ -8587,6 +8634,7 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'tool_result': {
+        this.activeToolUseIds.get(sessionId)?.delete(event.toolUseId)
         // toolName comes directly from CraftAgent (resolved via ToolIndex)
         const toolName = event.toolName || 'unknown'
 
@@ -9179,6 +9227,7 @@ export class SessionManager implements ISessionManager {
         break
 
       case 'complete':
+        this.activeToolUseIds.delete(sessionId)
         // Complete event from CraftAgent - accumulate usage from this turn
         // Actual 'complete' sent to renderer comes from the finally block in sendMessage
         if (event.usage) {
