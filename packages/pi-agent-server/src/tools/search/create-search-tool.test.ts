@@ -133,6 +133,51 @@ describe('createSearchTool', () => {
     expect(text.length).toBeLessThan(1_000);
   });
 
+  it('returns a visible deadline error and aborts a stalled primary instead of starting fallback', async () => {
+    let passedSignal: AbortSignal | undefined;
+    let fallbackCalls = 0;
+    const provider: WebSearchProvider = {
+      name: 'Stalled',
+      async search(_query, _count, signal) {
+        passedSignal = signal;
+        return new Promise(() => {});
+      },
+    };
+    const fallbackProvider: WebSearchProvider = {
+      name: 'DuckDuckGo',
+      async search() {
+        fallbackCalls++;
+        return [];
+      },
+    };
+
+    const result = await createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
+      .execute('call-stall', { query: 'test' });
+
+    expect(result.details?.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain('timed out after 10 ms');
+    expect(passedSignal?.aborted).toBe(true);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it('applies the same deadline across primary and stalled fallback', async () => {
+    let fallbackSignal: AbortSignal | undefined;
+    const provider: WebSearchProvider = { name: 'Broken', async search() { throw new Error('primary failed'); } };
+    const fallbackProvider: WebSearchProvider = {
+      name: 'DuckDuckGo',
+      async search(_query, _count, signal) {
+        fallbackSignal = signal;
+        return new Promise(() => {});
+      },
+    };
+    const result = await createSearchTool(provider, fallbackProvider, { deadlineMs: 10 })
+      .execute('call-fallback-stall', { query: 'test' });
+
+    expect(result.details?.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain('timed out after 10 ms');
+    expect(fallbackSignal?.aborted).toBe(true);
+  });
+
   it('does not recurse fallback when provider is already fallback provider', async () => {
     const ddgProvider: WebSearchProvider = {
       name: 'DuckDuckGo',

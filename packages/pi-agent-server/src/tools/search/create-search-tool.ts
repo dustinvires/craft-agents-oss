@@ -10,6 +10,10 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { WebSearchProvider, WebSearchResult } from './types.ts';
 import { DDGSearchProvider } from './providers/ddg.ts';
 
+// A stalled provider must not hold an agent turn indefinitely. Provider-level request
+// timeouts still apply; this caps the entire primary + fallback sequence.
+const SEARCH_DEADLINE_MS = 90_000;
+
 const schema = Type.Object({
   query: Type.String({ description: 'The search query' }),
   count: Type.Optional(
@@ -56,6 +60,7 @@ function formatErrorSnippet(message: string, max = 180): string {
 export function createSearchTool(
   provider: WebSearchProvider,
   fallbackProvider: WebSearchProvider = new DDGSearchProvider(),
+  options?: { deadlineMs?: number },
 ): ToolDefinition<typeof schema> {
   return {
     name: 'web_search',
@@ -68,46 +73,69 @@ export function createSearchTool(
     async execute(toolCallId, params) {
       const { query } = params;
       const count = Math.max(1, Math.min(10, params.count ?? 5));
+      const deadlineMs = Math.max(1, options?.deadlineMs ?? SEARCH_DEADLINE_MS);
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+
+      const deadline = new Promise<{ content: Array<{ type: 'text'; text: string }>; details: { isError: boolean } }>(resolve => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+          resolve({
+            content: [{ type: 'text', text: `Search timed out after ${deadlineMs} ms for "${query}" (primary and fallback combined).` }],
+            details: { isError: true },
+          });
+        }, deadlineMs);
+      });
+
+      const search = async () => {
+        try {
+          const results = await provider.search(query, count, controller.signal);
+          return formatResults(query, provider.name, results);
+        } catch (err) {
+          const primaryMsg = err instanceof Error ? err.message : String(err);
+
+          const canFallback = !timedOut && provider.name !== fallbackProvider.name;
+          if (canFallback) {
+            try {
+              const fallbackResults = await fallbackProvider.search(query, count, controller.signal);
+              return formatResults(
+                query,
+                fallbackProvider.name,
+                fallbackResults,
+                `Primary search provider (${provider.name}) failed (${formatErrorSnippet(primaryMsg)}), automatically fell back to ${fallbackProvider.name}.`,
+              );
+            } catch (fallbackErr) {
+              const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Search failed for "${query}": primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"`,
+                  },
+                ],
+                details: { isError: true },
+              };
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Search failed for "${query}": ${formatErrorSnippet(primaryMsg, 400)}`,
+              },
+            ],
+            details: { isError: true },
+          };
+        }
+      };
 
       try {
-        const results = await provider.search(query, count);
-        return formatResults(query, provider.name, results);
-      } catch (err) {
-        const primaryMsg = err instanceof Error ? err.message : String(err);
-
-        const canFallback = provider.name !== fallbackProvider.name;
-        if (canFallback) {
-          try {
-            const fallbackResults = await fallbackProvider.search(query, count);
-            return formatResults(
-              query,
-              fallbackProvider.name,
-              fallbackResults,
-              `Primary search provider (${provider.name}) failed (${formatErrorSnippet(primaryMsg)}), automatically fell back to ${fallbackProvider.name}.`,
-            );
-          } catch (fallbackErr) {
-            const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `Search failed for "${query}": primary (${provider.name}) failed with "${formatErrorSnippet(primaryMsg, 400)}"; fallback (${fallbackProvider.name}) failed with "${formatErrorSnippet(fallbackMsg, 400)}"`,
-                },
-              ],
-              details: { isError: true },
-            };
-          }
-        }
-
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Search failed for "${query}": ${formatErrorSnippet(primaryMsg, 400)}`,
-            },
-          ],
-          details: { isError: true },
-        };
+        return await Promise.race([search(), deadline]);
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     },
   };

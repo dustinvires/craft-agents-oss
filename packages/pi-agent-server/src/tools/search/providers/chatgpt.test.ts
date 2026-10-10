@@ -307,6 +307,38 @@ describe('ChatGPTBackendSearchProvider', () => {
     expect(results[0]?.url).toBe('https://sse-retry.example');
   });
 
+  it('parses CRLF-delimited SSE completion events', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Result","annotations":[{"type":"url_citation","url":"https://crlf.example","title":"CRLF"}]}]}]}}',
+      '',
+    ].join('\r\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    const results = await new ChatGPTBackendSearchProvider('token', 'acc_123').search('CRLF query', 3);
+    expect(results[0]?.url).toBe('https://crlf.example');
+  });
+
+  it('reports a terminal SSE failure without exposing raw stream data', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"error":{"code":"tool_unavailable","message":"Hosted search is unavailable"}}}',
+      '',
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"error":{"code":"tool_unavailable","message":"Hosted search is unavailable"}}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    let message = '';
+    try {
+      await new ChatGPTBackendSearchProvider('token', 'acc_123').search('secret query', 3);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain('response.failed (tool_unavailable): Hosted search is unavailable');
+    expect(message).not.toContain('secret query');
+  });
+
   it('aggregates parse failures when both attempts fail to parse', async () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = init?.body ? JSON.parse(String(init.body)) : null;

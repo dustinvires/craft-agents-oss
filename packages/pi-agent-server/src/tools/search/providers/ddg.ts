@@ -35,14 +35,16 @@ function isTransientDdgError(error: unknown): boolean {
   );
 }
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, retries = 2, signal?: AbortSignal): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    signal?.throwIfAborted();
     try {
       return await fn();
     } catch (error) {
       lastError = error;
+      signal?.throwIfAborted();
 
       const canRetry = attempt < retries && isTransientDdgError(error);
       if (!canRetry) {
@@ -145,10 +147,10 @@ function extractResultsFromDuckDuckGoHtml(
   return results;
 }
 
-async function fetchDuckDuckGoHtml(url: string, endpointName: string): Promise<string> {
+async function fetchDuckDuckGoHtml(url: string, endpointName: string, signal?: AbortSignal): Promise<string> {
   const response = await fetch(url, {
     headers: DEFAULT_HEADERS,
-    signal: AbortSignal.timeout(15_000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
   });
 
   if (!response.ok) {
@@ -158,10 +160,16 @@ async function fetchDuckDuckGoHtml(url: string, endpointName: string): Promise<s
   return response.text();
 }
 
-async function searchDDGApi(query: string, count: number): Promise<WebSearchResult[]> {
+async function searchDDGApi(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
   const response = await withRetry(
-    () => DDG.search(query, { safeSearch: DDG.SafeSearchType.MODERATE }),
+    () => DDG.search(query, { safeSearch: DDG.SafeSearchType.MODERATE }, {
+      signal,
+      open_timeout: 5_000,
+      response_timeout: 12_000,
+      read_timeout: 12_000,
+    }),
     2,
+    signal,
   );
 
   if (response.noResults || !response.results?.length) {
@@ -175,9 +183,9 @@ async function searchDDGApi(query: string, count: number): Promise<WebSearchResu
   }));
 }
 
-async function searchDDGHtml(query: string, count: number): Promise<WebSearchResult[]> {
+async function searchDDGHtml(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const html = await fetchDuckDuckGoHtml(url, 'DDG HTML');
+  const html = await fetchDuckDuckGoHtml(url, 'DDG HTML', signal);
   const results = extractResultsFromDuckDuckGoHtml(html, count);
 
   if (results.length === 0) {
@@ -187,9 +195,9 @@ async function searchDDGHtml(query: string, count: number): Promise<WebSearchRes
   return results;
 }
 
-async function searchDDGLite(query: string, count: number): Promise<WebSearchResult[]> {
+async function searchDDGLite(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
   const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-  const html = await fetchDuckDuckGoHtml(url, 'DDG Lite');
+  const html = await fetchDuckDuckGoHtml(url, 'DDG Lite', signal);
   const results = extractResultsFromDuckDuckGoHtml(html, count);
 
   if (results.length === 0) {
@@ -202,23 +210,25 @@ async function searchDDGLite(query: string, count: number): Promise<WebSearchRes
 export class DDGSearchProvider implements WebSearchProvider {
   name = 'DuckDuckGo';
 
-  async search(query: string, count: number): Promise<WebSearchResult[]> {
+  async search(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
     const failurePath: string[] = [];
 
     try {
-      return await searchDDGApi(query, count);
+      return await searchDDGApi(query, count, signal);
     } catch (err) {
+      signal?.throwIfAborted();
       failurePath.push(`ddg_primary:${err instanceof Error ? err.message : String(err)}`);
     }
 
     try {
-      return await searchDDGHtml(query, count);
+      return await searchDDGHtml(query, count, signal);
     } catch (err) {
+      signal?.throwIfAborted();
       failurePath.push(`ddg_html:${err instanceof Error ? err.message : String(err)}`);
     }
 
     try {
-      return await searchDDGLite(query, count);
+      return await searchDDGLite(query, count, signal);
     } catch (err) {
       failurePath.push(`ddg_lite:${err instanceof Error ? err.message : String(err)}`);
     }

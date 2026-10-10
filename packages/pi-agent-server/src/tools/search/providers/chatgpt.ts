@@ -83,7 +83,7 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
     private options?: { model?: string },
   ) {}
 
-  async search(query: string, count: number): Promise<WebSearchResult[]> {
+  async search(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
     const attemptErrors: string[] = [];
     const models = this.candidateModels();
 
@@ -129,7 +129,7 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
             'OpenAI-Beta': 'responses=experimental',
           },
           body: JSON.stringify(requestBody),
-          signal: AbortSignal.timeout(30_000),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
         });
 
         const contentType = response.headers.get('content-type') || 'unknown';
@@ -233,8 +233,10 @@ async function parseResponsePayload(response: Response): Promise<ResponsesApiRes
 
 function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
   let completed: ResponsesApiResponse | null = null;
+  let terminalFailure: string | null = null;
 
-  for (const chunk of sseText.split('\n\n')) {
+  // SSE permits CRLF and CR as well as LF; normalize before splitting events.
+  for (const chunk of sseText.replace(/\r\n?/g, '\n').split('\n\n')) {
     const dataLines = chunk
       .split('\n')
       .map(line => line.trim())
@@ -255,12 +257,19 @@ function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
         if (event.response && typeof event.response === 'object') {
           completed = event.response as ResponsesApiResponse;
         }
+      } else if (event?.type === 'response.failed' || event?.type === 'response.incomplete' || event?.type === 'error') {
+        // Do not include raw SSE: it may contain the query or other response data.
+        const code = event.response?.error?.code ?? event.error?.code ?? event.response?.incomplete_details?.reason;
+        const message = event.response?.error?.message ?? event.error?.message ?? event.message;
+        terminalFailure = `${event.type}${code ? ` (${compactErrorText(String(code)).slice(0, 80)})` : ''}${message ? `: ${compactErrorText(String(message)).slice(0, 180)}` : ''}`;
       }
     }
   }
 
   if (!completed) {
-    throw new Error('ChatGPT search stream returned no completed response payload');
+    throw new Error(terminalFailure
+      ? `ChatGPT search stream ended with ${terminalFailure}`
+      : 'ChatGPT search stream returned no completed response payload');
   }
 
   return completed;
