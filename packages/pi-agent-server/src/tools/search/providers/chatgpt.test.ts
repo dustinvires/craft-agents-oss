@@ -335,8 +335,33 @@ describe('ChatGPTBackendSearchProvider', () => {
       message = error instanceof Error ? error.message : String(error);
     }
 
-    expect(message).toContain('response.failed (tool_unavailable): Hosted search is unavailable');
+    expect(message).toContain('provider-declared response.failed (tool_unavailable): Hosted search is unavailable');
+    expect(message).toContain('kinds=response.failed:2');
     expect(message).not.toContain('secret query');
+  });
+
+  it('records only sanitized event shape when completion is missing', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"secret query and page text"}',
+      '',
+      'data: {malformed',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    let message = '';
+    try {
+      await new ChatGPTBackendSearchProvider('token', 'acc_123').search('secret query', 3);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('no completed response payload (cause unknown)');
+    expect(message).toContain('parsedEvents=1, invalidJson=1, doneMarkers=1');
+    expect(message).toContain('kinds=response.output_text.delta:1');
+    expect(message).not.toContain('secret query');
+    expect(message).not.toContain('page text');
   });
 
   it('aggregates parse failures when both attempts fail to parse', async () => {

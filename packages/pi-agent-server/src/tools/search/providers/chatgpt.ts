@@ -234,6 +234,11 @@ async function parseResponsePayload(response: Response): Promise<ResponsesApiRes
 function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
   let completed: ResponsesApiResponse | null = null;
   let terminalFailure: string | null = null;
+  let parsedEvents = 0;
+  let invalidJson = 0;
+  let doneMarkers = 0;
+  let completionWithoutPayload = 0;
+  const eventKinds = new Map<string, number>();
 
   // SSE permits CRLF and CR as well as LF; normalize before splitting events.
   for (const chunk of sseText.replace(/\r\n?/g, '\n').split('\n\n')) {
@@ -245,17 +250,30 @@ function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
       .filter(Boolean);
 
     for (const line of dataLines) {
-      if (line === '[DONE]') continue;
+      if (line === '[DONE]') {
+        doneMarkers++;
+        continue;
+      }
       let event: any;
       try {
         event = JSON.parse(line);
       } catch {
+        invalidJson++;
         continue;
       }
+      parsedEvents++;
+      // Only the event type and counts are retained. Never keep the stream
+      // body here: it can contain the user's query or returned page content.
+      const rawKind = event?.type;
+      const kind = typeof rawKind === 'string' && /^[a-z][a-z0-9_.-]{0,60}$/.test(rawKind)
+        ? rawKind : 'unrecognized';
+      eventKinds.set(kind, (eventKinds.get(kind) ?? 0) + 1);
 
       if (event?.type === 'response.completed' || event?.type === 'response.done') {
         if (event.response && typeof event.response === 'object') {
           completed = event.response as ResponsesApiResponse;
+        } else {
+          completionWithoutPayload++;
         }
       } else if (event?.type === 'response.failed' || event?.type === 'response.incomplete' || event?.type === 'error') {
         // Do not include raw SSE: it may contain the query or other response data.
@@ -267,9 +285,11 @@ function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
   }
 
   if (!completed) {
+    const kinds = [...eventKinds].slice(0, 6).map(([kind, count]) => `${kind}:${count}`).join(',') || 'none';
+    const trace = `streamChars=${sseText.length}, parsedEvents=${parsedEvents}, invalidJson=${invalidJson}, doneMarkers=${doneMarkers}, completionWithoutPayload=${completionWithoutPayload}, kinds=${kinds}`;
     throw new Error(terminalFailure
-      ? `ChatGPT search stream ended with ${terminalFailure}`
-      : 'ChatGPT search stream returned no completed response payload');
+      ? `ChatGPT search stream ended with provider-declared ${terminalFailure} [${trace}]`
+      : `ChatGPT search stream returned no completed response payload (cause unknown) [${trace}]`);
   }
 
   return completed;
