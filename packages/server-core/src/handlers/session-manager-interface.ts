@@ -155,6 +155,10 @@ export interface ISessionManager {
   ): boolean
   respondToCredential(sessionId: string, requestId: string, response: CredentialResponse): Promise<boolean>
   getSessionPermissionModeState(sessionId: string): PermissionModeState | null
+  /** Safe recovery must fail closed if the server cannot enumerate live background work. */
+  listBackgroundTasks?(sessionId: string): Array<{ status: string }>
+  /** One synchronous safety check + stop intent, before any async handoff. */
+  cancelReadOnlyTurn?(sessionId: string, turnId: string, expectedModeVersion: number): Promise<boolean>
 
   // ---------------------------------------------------------------------------
   // Plans

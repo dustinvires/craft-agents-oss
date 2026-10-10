@@ -10,6 +10,7 @@
  */
 
 import type { WebSearchProvider, WebSearchResult } from '../types.ts';
+import { carryFailedResponse, rememberFailedResponse } from '../failure-evidence.ts';
 import { parseResponsesApiResults, type ResponsesApiResponse } from './responses-api-parser.ts';
 import { isModelRejectionError } from '../../../model-resolution.ts';
 import { stripPiPrefix } from '../../../custom-endpoint-models.ts';
@@ -83,8 +84,14 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
     private options?: { model?: string },
   ) {}
 
-  async search(query: string, count: number): Promise<WebSearchResult[]> {
+  async search(query: string, count: number, signal?: AbortSignal): Promise<WebSearchResult[]> {
     const attemptErrors: string[] = [];
+    let lastResponseFailure: Error | undefined;
+    const fail = (): never => {
+      const error = new Error(`ChatGPT search failed: ${summarizeAttemptErrors(attemptErrors)}`);
+      carryFailedResponse(lastResponseFailure, error);
+      throw error;
+    };
     const models = this.candidateModels();
 
     for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
@@ -129,33 +136,36 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
             'OpenAI-Beta': 'responses=experimental',
           },
           body: JSON.stringify(requestBody),
-          signal: AbortSignal.timeout(30_000),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
         });
 
         const contentType = response.headers.get('content-type') || 'unknown';
+        const safeContentType = contentType.split(';', 1)[0]!.replace(/[^a-zA-Z0-9/.-]/g, '').slice(0, 80) || 'unknown';
 
         if (response.ok) {
           try {
             const data = await parseResponsePayload(response);
             return parseResponsesApiResults(data, query, count);
           } catch (parseError) {
-            const parseMessage = parseError instanceof Error ? parseError.message : String(parseError);
+            if (parseError instanceof Error) lastResponseFailure = parseError;
             attemptErrors.push(
-              `${attempt.label} parse failed [${requestFingerprint}, content-type=${contentType}]: ${compactErrorText(parseMessage)}`,
+              `${attempt.label} parse failed [${requestFingerprint}, content-type=${safeContentType}]: ${safeParseFailure(parseError)}`,
             );
 
             if (hasMoreAttempts) {
               continue;
             }
 
-            throw new Error(`ChatGPT search failed: ${summarizeAttemptErrors(attemptErrors)}`);
+            fail();
           }
         }
 
-        const errorText = await response.text();
-        const compactError = compactErrorText(errorText);
+        const errorText = await readLimitedResponseText(response);
+        const responseFailure = new Error(`HTTP ${response.status}`);
+        rememberFailedResponse(responseFailure, { raw: errorText, status: response.status, contentType });
+        lastResponseFailure = responseFailure;
         attemptErrors.push(
-          `${attempt.label} failed (HTTP ${response.status}) [${requestFingerprint}, content-type=${contentType}]: ${compactError}`,
+          `${attempt.label} failed (HTTP ${response.status}) [${requestFingerprint}, content-type=${safeContentType}]: ${safeErrorCode(errorText)}`,
         );
 
         // Unsupported-model refusal (e.g. the account rejects a retired model): the tool type
@@ -172,7 +182,7 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
         // Other 400 → likely schema/tool incompatibility → retry with the next tool type.
         const canRetry = response.status === 400;
         if (!(canRetry && hasMoreAttempts)) {
-          throw new Error(`ChatGPT search failed: ${summarizeAttemptErrors(attemptErrors)}`);
+          fail();
         }
       }
 
@@ -180,12 +190,10 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
       if (modelRejected && hasMoreModels) {
         continue;
       }
-      if (modelRejected) {
-        throw new Error(`ChatGPT search failed: ${summarizeAttemptErrors(attemptErrors)}`);
-      }
+      if (modelRejected) fail();
     }
 
-    throw new Error(`ChatGPT search failed: ${summarizeAttemptErrors(attemptErrors)}`);
+    return fail();
   }
 
   /**
@@ -212,29 +220,76 @@ export class ChatGPTBackendSearchProvider implements WebSearchProvider {
 
 async function parseResponsePayload(response: Response): Promise<ResponsesApiResponse> {
   const contentType = response.headers.get('content-type') || '';
-  const raw = await response.text();
-
-  const looksLikeSse =
-    contentType.includes('text/event-stream') ||
-    raw.startsWith('event:') ||
-    raw.includes('\ndata:') ||
-    raw.includes('\n\nevent:');
-
-  if (looksLikeSse) {
-    return parseSseResponsePayload(raw);
-  }
-
+  const raw = await readLimitedResponseText(response);
   try {
-    return JSON.parse(raw) as ResponsesApiResponse;
-  } catch {
-    throw new Error(`ChatGPT search response parse failed: expected JSON or SSE payload, got: ${compactErrorText(raw)}`);
+    const looksLikeSse =
+      contentType.includes('text/event-stream') ||
+      raw.startsWith('event:') ||
+      raw.includes('\ndata:') ||
+      raw.includes('\n\nevent:');
+
+    if (looksLikeSse) return parseSseResponsePayload(raw);
+    try {
+      return JSON.parse(raw) as ResponsesApiResponse;
+    } catch {
+      throw new Error('ChatGPT search response parse failed: expected JSON or SSE payload');
+    }
+  } catch (error) {
+    if (error instanceof Error) rememberFailedResponse(error, { raw, status: response.status, contentType });
+    throw error;
   }
 }
 
+// A streaming provider can send an unending or enormous response. Bound bytes
+// *before* response.text() would allocate the whole body in process memory.
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+async function readLimitedResponseText(response: Response): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        const error = new Error('ChatGPT search response exceeded the 2 MiB safety limit');
+        rememberFailedResponse(error, {
+          raw: text.slice(0, 64 * 1024), status: response.status,
+          contentType: response.headers.get('content-type') || 'unknown',
+        });
+        throw error;
+      }
+      text += decoder.decode(part.value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+const KNOWN_SSE_EVENT_TYPES = new Set([
+  'response.created', 'response.in_progress', 'response.completed', 'response.done',
+  'response.failed', 'response.incomplete', 'response.output_item.added',
+  'response.output_item.done', 'response.content_part.added', 'response.content_part.done',
+  'response.output_text.delta', 'response.output_text.done', 'response.web_search_call.in_progress',
+  'response.web_search_call.completed', 'error',
+]);
+
 function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
   let completed: ResponsesApiResponse | null = null;
+  let terminalFailure: string | null = null;
+  let parsedEvents = 0;
+  let invalidJson = 0;
+  let doneMarkers = 0;
+  let completionWithoutPayload = 0;
+  const eventKinds = new Map<string, number>();
 
-  for (const chunk of sseText.split('\n\n')) {
+  // SSE permits CRLF and CR as well as LF; normalize before splitting events.
+  for (const chunk of sseText.replace(/\r\n?/g, '\n').split('\n\n')) {
     const dataLines = chunk
       .split('\n')
       .map(line => line.trim())
@@ -243,24 +298,47 @@ function parseSseResponsePayload(sseText: string): ResponsesApiResponse {
       .filter(Boolean);
 
     for (const line of dataLines) {
-      if (line === '[DONE]') continue;
+      if (line === '[DONE]') {
+        doneMarkers++;
+        continue;
+      }
       let event: any;
       try {
         event = JSON.parse(line);
       } catch {
+        invalidJson++;
         continue;
       }
+      parsedEvents++;
+      // Only the event type and counts are retained. Never keep the stream
+      // body here: it can contain the user's query or returned page content.
+      const rawKind = event?.type;
+      const kind = typeof rawKind === 'string' && KNOWN_SSE_EVENT_TYPES.has(rawKind) ? rawKind : 'unrecognized';
+      eventKinds.set(kind, (eventKinds.get(kind) ?? 0) + 1);
 
       if (event?.type === 'response.completed' || event?.type === 'response.done') {
         if (event.response && typeof event.response === 'object') {
           completed = event.response as ResponsesApiResponse;
+        } else {
+          completionWithoutPayload++;
         }
+      } else if (event?.type === 'response.failed' || event?.type === 'response.incomplete' || event?.type === 'error') {
+        // Do not include raw SSE: it may contain the query or other response data.
+        const code = event.response?.error?.code ?? event.error?.code ?? event.response?.incomplete_details?.reason;
+        // Provider-controlled message can echo queries or page content. Keep
+        // only a constrained error code in the transcript; raw body is held
+        // for opt-in encrypted capture if *all* search providers fail.
+        terminalFailure = `${kind}${typeof code === 'string' ? ` (${safeErrorCodeTag(code)})` : ''}`;
       }
     }
   }
 
   if (!completed) {
-    throw new Error('ChatGPT search stream returned no completed response payload');
+    const kinds = [...eventKinds].slice(0, 6).map(([kind, count]) => `${kind}:${count}`).join(',') || 'none';
+    const trace = `streamChars=${sseText.length}, parsedEvents=${parsedEvents}, invalidJson=${invalidJson}, doneMarkers=${doneMarkers}, completionWithoutPayload=${completionWithoutPayload}, kinds=${kinds}`;
+    throw new Error(terminalFailure
+      ? `ChatGPT search stream ended with provider-declared ${terminalFailure} [${trace}]`
+      : `ChatGPT search stream returned no completed response payload (cause unknown) [${trace}]`);
   }
 
   return completed;
@@ -296,8 +374,29 @@ function buildRequestFingerprint(body: {
   return `tool=${toolType}, model=${body.model}, store=${String(body.store)}, stream=${String(body.stream)}, tool_choice=${body.tool_choice}, text.verbosity=${verbosity}`;
 }
 
-function compactErrorText(text: string): string {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  if (!normalized) return 'Bad Request';
-  return normalized.slice(0, ERROR_TEXT_LIMIT);
+function safeParseFailure(error: unknown): string {
+  const text = error instanceof Error ? error.message : '';
+  // Only messages this parser constructs can be placed in ordinary tool output.
+  // An arbitrary JSON SyntaxError or SDK exception may quote raw response text.
+  if (/^ChatGPT search (?:stream returned no completed response payload|stream ended with provider-declared|response parse failed: expected JSON or SSE payload|response exceeded the 2 MiB safety limit)/.test(text)) {
+    return text.slice(0, ERROR_TEXT_LIMIT);
+  }
+  return 'unrecognized response parse failure (raw text omitted)';
+}
+
+const COMMON_CODES = new Set(['tool_unavailable', 'model_not_found', 'invalid_request_error', 'rate_limit_exceeded', 'unsupported_model']);
+function safeErrorCodeTag(code: string): string {
+  if (COMMON_CODES.has(code)) return code;
+  // Provider-controlled codes could quote a one-word query. A plain hash can
+  // be reversed by trying a small dictionary, so do not put one in the log.
+  return 'code=unrecognized';
+}
+
+function safeErrorCode(body: string): string {
+  try {
+    const parsed = JSON.parse(body);
+    const code = parsed?.error?.code ?? parsed?.code;
+    if (typeof code === 'string') return safeErrorCodeTag(code);
+  } catch { /* HTTP status and request fingerprint remain available. */ }
+  return 'body retained only in encrypted evidence if this search fails';
 }

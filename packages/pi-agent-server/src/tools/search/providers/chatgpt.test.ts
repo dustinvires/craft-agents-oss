@@ -307,6 +307,101 @@ describe('ChatGPTBackendSearchProvider', () => {
     expect(results[0]?.url).toBe('https://sse-retry.example');
   });
 
+  it('parses CRLF-delimited SSE completion events', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Result","annotations":[{"type":"url_citation","url":"https://crlf.example","title":"CRLF"}]}]}]}}',
+      '',
+    ].join('\r\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    const results = await new ChatGPTBackendSearchProvider('token', 'acc_123').search('CRLF query', 3);
+    expect(results[0]?.url).toBe('https://crlf.example');
+  });
+
+  it('reports a terminal SSE failure without exposing raw stream data', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"error":{"code":"tool_unavailable","message":"Hosted search is unavailable"}}}',
+      '',
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"error":{"code":"tool_unavailable","message":"Hosted search is unavailable"}}}',
+      '',
+    ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    let message = '';
+    try {
+      await new ChatGPTBackendSearchProvider('token', 'acc_123').search('secret query', 3);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain('provider-declared response.failed (tool_unavailable)');
+    expect(message).toContain('kinds=response.failed:2');
+    expect(message).not.toContain('Hosted search is unavailable');
+    expect(message).not.toContain('secret query');
+  });
+
+  it('records only sanitized event shape when completion is missing', async () => {
+    globalThis.fetch = (async () => new Response([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"secret query and page text"}',
+      '',
+      'data: {malformed',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+    let message = '';
+    try {
+      await new ChatGPTBackendSearchProvider('token', 'acc_123').search('secret query', 3);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('no completed response payload (cause unknown)');
+    expect(message).toContain('parsedEvents=1, invalidJson=1, doneMarkers=1');
+    expect(message).toContain('kinds=response.output_text.delta:1');
+    expect(message).not.toContain('secret query');
+    expect(message).not.toContain('page text');
+  });
+
+  it('does not reveal a query echoed in arbitrary SSE event types or provider codes', async () => {
+    globalThis.fetch = (async () => new Response([
+      'data: {"type":"sensitive42","message":"sensitive42"}', '',
+      'data: {"type":"response.failed","response":{"error":{"code":"sensitive42"}}}', '',
+    ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+    let message = '';
+    try { await new ChatGPTBackendSearchProvider('token', 'acc_123').search('sensitive42', 3); }
+    catch (error) { message = error instanceof Error ? error.message : String(error); }
+    expect(message).toContain('code=unrecognized');
+    expect(message).toContain('kinds=unrecognized:1,response.failed:1');
+    expect(message).not.toContain('sensitive42');
+  });
+
+  it('does not reveal a query echoed as an HTTP error code', async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({error:{code:'sensitive42',message:'sensitive42'}}),
+      { status: 403, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+    let message = '';
+    try { await new ChatGPTBackendSearchProvider('token', 'acc_123').search('sensitive42', 3); }
+    catch (error) { message = error instanceof Error ? error.message : String(error); }
+    expect(message).toContain('code=unrecognized');
+    expect(message).not.toContain('sensitive42');
+  });
+
+  it('caps a large streaming response before retrying a healthy provider', async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts++;
+      return attempts === 1
+        ? new Response('x'.repeat(2 * 1024 * 1024 + 1), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+        : new Response(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Recovered' }] }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+    const results = await new ChatGPTBackendSearchProvider('token', 'acc_123').search('large response', 3);
+    expect(attempts).toBe(2);
+    expect(results.length).toBeGreaterThan(0);
+  });
+
   it('aggregates parse failures when both attempts fail to parse', async () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = init?.body ? JSON.parse(String(init.body)) : null;
@@ -330,6 +425,7 @@ describe('ChatGPTBackendSearchProvider', () => {
     expect(message).toContain('web_search parse failed');
     expect(message).toContain('web_search_preview parse failed');
     expect(message).toContain('content-type=text/plain');
+    expect(message).not.toContain('Bad Request from');
   });
 
   it('throws immediately on non-400 errors (no retry) with request fingerprint', async () => {

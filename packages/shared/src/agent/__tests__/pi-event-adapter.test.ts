@@ -856,6 +856,24 @@ describe('PiEventAdapter', () => {
       });
     });
 
+    it('delivers a terminal web_search failure as a detectable error event', () => {
+      collect(adapter.adaptEvent({ type: 'turn_start' } as any));
+      collect(adapter.adaptEvent({
+        type: 'tool_execution_start', toolCallId: 'search_1', toolName: 'web_search', args: { query: 'private words' },
+      } as any));
+      const events = collect(adapter.adaptEvent({
+        type: 'tool_execution_end', toolCallId: 'search_1', toolName: 'web_search',
+        result: { content: [{ type: 'text', text: 'Web search failed: providers unavailable' }] },
+        isError: true,
+      } as any));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: 'tool_result', toolName: 'WebSearch', isError: true,
+        result: 'Web search failed: providers unavailable',
+      });
+      expect(JSON.stringify(events)).not.toContain('private words');
+    });
+
     it('should handle string result in tool_execution_end', () => {
       collect(adapter.adaptEvent({ type: 'turn_start' } as any));
       collect(adapter.adaptEvent({
